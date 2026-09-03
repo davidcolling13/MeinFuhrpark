@@ -19,7 +19,6 @@ import { DashboardView } from './views/DashboardView';
 import { VehicleListView, CombinationsView } from './views/VehicleView';
 import { AppointmentsView, OrdersView } from './views/PlanningView';
 import { HistoryView, AdminView } from './views/ReportView';
-import { AnalyticsView } from './views/AnalyticsView';
 
 // Initialize React Query Client
 const queryClient = new QueryClient({
@@ -135,7 +134,6 @@ const FleetApp = () => {
                         {view === 'history' && (
                             <HistoryView onEdit={(l:any) => setEntryModal({open:true, data:l})} />
                         )}
-                        {view === 'analytics' && <AnalyticsView />}
                         {view === 'admin' && <AdminView />}
                     </>
                 )}

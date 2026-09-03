@@ -23,7 +23,6 @@ export const Layout = ({ children, currentView, setView, onRefresh }: LayoutProp
                     <NavButton icon={<Icons.Calendar />} label="Termine" active={currentView === 'appointments'} onClick={() => setView('appointments')} />
                     <NavButton icon={<Icons.ShoppingCart />} label="Bestellungen" active={currentView === 'orders'} onClick={() => setView('orders')} />
                     <NavButton icon={<Icons.History />} label="Historie" active={currentView === 'history'} onClick={() => setView('history')} />
-                    <NavButton icon={<Icons.Chart />} label="Auswertungen" active={currentView === 'analytics'} onClick={() => setView('analytics')} />
                     <NavButton icon={<Icons.Link />} label="Gespanne" active={currentView === 'combinations'} onClick={() => setView('combinations')} />
                     <NavButton icon={<Icons.Truck />} label="Fahrzeuge" active={currentView === 'vehicles'} onClick={() => setView('vehicles')} />
                     <div className="pt-4 mt-4 border-t border-slate-700">
