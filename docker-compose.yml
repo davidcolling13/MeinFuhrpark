@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  fuhrpark-manager:
+    # 'build' wurde entfernt. Docker lädt nun das fertige Image herunter.
+    image: ghcr.io/davidcolling13/meinfuhrpark:latest
+    container_name: fuhrpark_app
+    restart: unless-stopped
+    ports:
+      - "450:3000"
+    volumes:
+      # Persistiert die Datenbank lokal
+      - ./data:/app/data
+    environment:
+      - PORT=3000
