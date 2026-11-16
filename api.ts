@@ -16,17 +16,69 @@ const mockDB = {
             localStorage.setItem(`fuhrpark_${key}`, JSON.stringify(data));
         } catch(e: any) {
             if(e.name === 'QuotaExceededError') toast.error("OFFLINE SPEICHER VOLL!");
+            throw e;
         }
     },
-    // Mock Pagination support
-    async getLogs(page?: number, limit?: number, status?: string) {
+    // Mock Pagination & Full Filter Support
+    async getLogs(params: {
+        page?: number;
+        limit?: number;
+        status?: string;
+        vehicleId?: string;
+        startDate?: string;
+        endDate?: string;
+        text?: string;
+        licensePlate?: string;
+        vType?: string;
+        category?: string;
+    } = {}) {
+        const { page, limit, status, vehicleId, startDate, endDate, text, licensePlate, vType, category } = params;
         let logs = this.load('logs');
+        const vehicles = this.load('vehicles');
+        const vehicleMap = new Map<string, any>(vehicles.map((v: any) => [v.id, v]));
+
         if (status) {
             if (status === '!DONE') logs = logs.filter((l:any) => l.status !== 'DONE');
             else logs = logs.filter((l:any) => l.status === status);
         }
-        // Sort DESC
-        logs.sort((a:any, b:any) => b.dateAdded.localeCompare(a.dateAdded));
+        if (vehicleId) {
+            logs = logs.filter((l:any) => l.vehicleId === vehicleId);
+        }
+        if (startDate) {
+            logs = logs.filter((l:any) => (l.dateCompleted || '') >= startDate);
+        }
+        if (endDate) {
+            logs = logs.filter((l:any) => (l.dateCompleted || '') <= endDate);
+        }
+        if (text) {
+            const q = text.toLowerCase();
+            logs = logs.filter((l:any) => (l.description || '').toLowerCase().includes(q));
+        }
+        if (licensePlate) {
+            const q = licensePlate.toLowerCase();
+            logs = logs.filter((l:any) => {
+                const v = vehicleMap.get(l.vehicleId);
+                return v && (v.licensePlate || '').toLowerCase().includes(q);
+            });
+        }
+        if (vType) {
+            logs = logs.filter((l:any) => {
+                const v = vehicleMap.get(l.vehicleId);
+                return v && v.type === vType;
+            });
+        }
+        if (category === 'inspection') {
+            logs = logs.filter((l:any) => Boolean(l.inspectionType) || l.type === 'Prüfung');
+        } else if (category === 'work') {
+            logs = logs.filter((l:any) => !l.inspectionType && l.type !== 'Prüfung');
+        }
+
+        // Sort DESC matching server.js
+        if (status === 'DONE') {
+            logs.sort((a:any, b:any) => (b.dateCompleted || '').localeCompare(a.dateCompleted || ''));
+        } else {
+            logs.sort((a:any, b:any) => (b.dateAdded || '').localeCompare(a.dateAdded || ''));
+        }
         
         const total = logs.length;
         if (page && limit) {
@@ -40,9 +92,14 @@ const mockDB = {
     },
     // Standard CRUD
     async get(collection: string) { return this.load(collection); },
+    async getVehicleDoc(id: string) {
+      const vehicles = this.load('vehicles');
+      const v = vehicles.find((x: any) => x.id === id);
+      return { doc: v ? (v.registrationDoc || null) : null };
+    },
     async post(collection: string, item: any) {
       const items = this.load(collection);
-      const newItem = { ...item, id: generateUUID() };
+      const newItem = { ...item, id: item.id || generateUUID(), version: 1 };
       items.push(newItem);
       this.save(collection, items);
       return { success: true, id: newItem.id };
@@ -50,14 +107,76 @@ const mockDB = {
     async put(collection: string, id: string, item: any) {
       const items = this.load(collection);
       const idx = items.findIndex((i:any) => i.id === id);
-      if (idx !== -1) { items[idx] = item; this.save(collection, items); }
+      if (idx !== -1) {
+          const existing = items[idx];
+          const existingVersion = existing.version ?? 1;
+          if (typeof item.version === 'number' && item.version !== existingVersion) {
+              const err: any = new Error('Konflikt: Der Datensatz wurde zwischenzeitlich geändert. Bitte laden Sie die Daten neu.');
+              err.status = 409;
+              throw err;
+          }
+          const nextVersion = existingVersion + 1;
+          // Preserve registrationDoc if null/undefined like server.js
+          if (collection === 'vehicles' && (item.registrationDoc === undefined || item.registrationDoc === null)) {
+              items[idx] = { ...item, id, registrationDoc: existing.registrationDoc ?? null, version: nextVersion };
+          } else {
+              items[idx] = { ...item, id, version: nextVersion };
+          }
+      } else {
+          items.push({ ...item, id, version: 1 });
+      }
+      this.save(collection, items);
       return { success: true };
     },
     async delete(collection: string, id: string) {
       const items = this.load(collection);
-      const filtered = items.filter((i:any) => i.id !== id);
+      let filtered = items.filter((i:any) => i.id !== id);
+      if (collection === 'vehicles') {
+          filtered = filtered.map((v: any) => v.coupledVehicleId === id ? { ...v, coupledVehicleId: null } : v);
+          const logs = this.load('logs').filter((l: any) => l.vehicleId !== id);
+          const orders = this.load('orders').filter((o: any) => o.vehicleId !== id);
+          this.save('logs', logs);
+          this.save('orders', orders);
+      }
       this.save(collection, filtered);
       return { success: true };
+    },
+    async transactionCouple(data: any) {
+        const { motorId, trailerId } = data || {};
+        if (!motorId || !trailerId || motorId === trailerId) {
+            throw new Error('Ungültige Fahrzeugauswahl zum Koppeln.');
+        }
+        const vehicles = this.load('vehicles');
+        const motor = vehicles.find((v: any) => v.id === motorId);
+        const trailer = vehicles.find((v: any) => v.id === trailerId);
+        if (!motor || !trailer) throw new Error('Mindestens ein Fahrzeug wurde nicht gefunden.');
+        if (motor.isActive === false || trailer.isActive === false) throw new Error('Inaktive Fahrzeuge können nicht gekoppelt werden.');
+
+        const updated = vehicles.map((v: any) => {
+            if (v.id === motorId) return { ...v, coupledVehicleId: trailerId };
+            if (v.id === trailerId) return { ...v, coupledVehicleId: motorId };
+            if (v.coupledVehicleId === motorId || v.coupledVehicleId === trailerId || v.id === motor.coupledVehicleId || v.id === trailer.coupledVehicleId) {
+                return { ...v, coupledVehicleId: null };
+            }
+            return v;
+        });
+        this.save('vehicles', updated);
+        return { success: true };
+    },
+    async transactionUncouple(data: any) {
+        const { motorId, trailerId } = data || {};
+        const vehicles = this.load('vehicles');
+        const updated = vehicles.map((v: any) => {
+            if (
+                (motorId && (v.id === motorId || v.coupledVehicleId === motorId)) ||
+                (trailerId && (v.id === trailerId || v.coupledVehicleId === trailerId))
+            ) {
+                return { ...v, coupledVehicleId: null };
+            }
+            return v;
+        });
+        this.save('vehicles', updated);
+        return { success: true };
     },
     async transactionCompleteTask(data: any) {
         const { logId, vehicleId, mileage, logData } = data;
@@ -98,7 +217,19 @@ const mockDB = {
 };
   
 let isOfflineMode = false;
+let offlineSince = 0;
+const OFFLINE_RETRY_COOLDOWN_MS = 15000;
 export const getIsOfflineMode = () => isOfflineMode;
+
+let adminToken: string | null = typeof sessionStorage !== 'undefined' ? sessionStorage.getItem('fuhrpark_admin_token') : null;
+export const getAdminToken = () => adminToken;
+export const setAdminToken = (token: string | null) => {
+    adminToken = token;
+    if (typeof sessionStorage !== 'undefined') {
+        if (token) sessionStorage.setItem('fuhrpark_admin_token', token);
+        else sessionStorage.removeItem('fuhrpark_admin_token');
+    }
+};
 
 // Global error reporting
 const reportClientError = async (error: any, context: string) => {
@@ -131,23 +262,54 @@ if (typeof window !== 'undefined') {
 
 export const api = {
     request: async (method: string, endpoint: string, data: any = null) => {
+      // Periodically allow online recovery if offline mode was entered due to a transient outage
+      if (isOfflineMode && Date.now() - offlineSince > OFFLINE_RETRY_COOLDOWN_MS) {
+          isOfflineMode = false;
+      }
+
       // Special Handling for Offline Logic
-      if (isOfflineMode || endpoint.startsWith('/transaction') && isOfflineMode) {
+      if (isOfflineMode) {
           if (endpoint === '/transaction/complete-task') return mockDB.transactionCompleteTask(data);
           if (endpoint === '/transaction/complete-inspection') return mockDB.transactionCompleteInspection(data);
+          if (endpoint === '/transaction/couple') return mockDB.transactionCouple(data);
+          if (endpoint === '/transaction/uncouple') return mockDB.transactionUncouple(data);
+
+          if (endpoint === '/admin/login' && method === 'POST') {
+              throw new Error('Admin-Login im Offline-Modus nicht verfügbar.');
+          }
+          if (endpoint.startsWith('/admin/')) {
+              if (endpoint === '/admin/logs' && method === 'GET') return { logs: '[Offline-Modus aktiv]' };
+              return { success: true };
+          }
           
-          // Handle Paging for logs
+          // Handle Paging & Filters for logs
           if (endpoint.startsWith('/logs') && method === 'GET') {
               const url = new URL('http://dummy' + endpoint);
               const page = parseInt(url.searchParams.get('page') || '0');
               const limit = parseInt(url.searchParams.get('limit') || '0');
-              const status = url.searchParams.get('status') || undefined;
-              return mockDB.getLogs(page || undefined, limit || undefined, status);
+              return mockDB.getLogs({
+                  page: page || undefined,
+                  limit: limit || undefined,
+                  status: url.searchParams.get('status') || undefined,
+                  vehicleId: url.searchParams.get('vehicleId') || undefined,
+                  startDate: url.searchParams.get('startDate') || undefined,
+                  endDate: url.searchParams.get('endDate') || undefined,
+                  text: url.searchParams.get('text') || undefined,
+                  licensePlate: url.searchParams.get('licensePlate') || undefined,
+                  vType: url.searchParams.get('vType') || undefined,
+                  category: url.searchParams.get('category') || undefined,
+              });
           }
           
           const parts = endpoint.split('?')[0].split('/').filter(Boolean); // remove query params
           const collection = parts[0];
           const id = parts[1];
+          const subResource = parts[2];
+
+          if (collection === 'vehicles' && id && subResource === 'doc' && method === 'GET') {
+              return mockDB.getVehicleDoc(id);
+          }
+
           // @ts-ignore
           if (method === 'GET') return mockDB.get(collection);
           // @ts-ignore
@@ -159,24 +321,38 @@ export const api = {
       }
   
       try {
-        const opts: any = { method, headers: { 'Content-Type': 'application/json' } };
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (adminToken && endpoint.startsWith('/admin/')) {
+            headers['Authorization'] = `Bearer ${adminToken}`;
+        }
+        const opts: any = { method, headers };
         if (data) opts.body = JSON.stringify(data);
         const res = await fetch(`/api${endpoint}`, opts);
+        const ct = res.headers.get("content-type");
         
         if (!res.ok) {
-            const ct = res.headers.get("content-type");
-            // If HTML error or 404/502 -> Backend Offline
-            if (!ct?.includes("application/json") || [404, 502, 503, 504].includes(res.status)) {
+            // Only treat gateway errors or non-JSON responses (except JSON 404s) as Backend Unavailable
+            if (!ct?.includes("application/json") || [502, 503, 504].includes(res.status)) {
                  throw new Error("Backend Unavailable");
             }
+            if (res.status === 401 && endpoint.startsWith('/admin/') && endpoint !== '/admin/login') {
+                setAdminToken(null);
+            }
             const errJson = await res.json().catch(() => ({}));
-            throw new Error(errJson.error || `Server Error: ${res.status}`);
+            const err: any = new Error(errJson.error || `Server Error: ${res.status}`);
+            err.status = res.status;
+            throw err;
         }
+        if (!ct?.includes("application/json")) {
+            throw new Error("Backend Unavailable");
+        }
+        isOfflineMode = false;
         return await res.json();
       } catch (e: any) {
-        if ((e.message === 'Backend Unavailable' || e.message.includes('Failed to fetch')) && !isOfflineMode) {
+        if ((e.message === 'Backend Unavailable' || e.message?.includes('Failed to fetch')) && !isOfflineMode) {
             console.warn('Switching to Offline Mode');
             isOfflineMode = true;
+            offlineSince = Date.now();
             return api.request(method, endpoint, data); // Retry offline
         }
         reportClientError(e, `API Error: ${method} ${endpoint}`);

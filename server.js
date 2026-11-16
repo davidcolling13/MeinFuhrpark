@@ -72,9 +72,6 @@ let db = new sqlite3.Database(dbPath, (err) => {
         db.run("PRAGMA journal_mode = WAL"); 
         db.run("PRAGMA synchronous = NORMAL");
         db.configure('busyTimeout', 5000);
-        db.run("CREATE INDEX IF NOT EXISTS idx_logs_vehicleId ON logs(vehicleId)");
-        db.run("CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status)");
-        db.run("CREATE INDEX IF NOT EXISTS idx_logs_dateAdded ON logs(dateAdded)");
     });
   }
 });
@@ -111,6 +108,25 @@ const get = (sql, params = []) => new Promise((resolve, reject) => {
   db.get(sql, params, (err, row) => { if (err) reject(err); else resolve(row); });
 });
 
+// Serialized write/transaction queue to prevent overlapping BEGIN/COMMIT across concurrent requests
+let txQueue = Promise.resolve();
+const enqueueExclusive = (fn) => {
+  const next = txQueue.then(() => fn());
+  txQueue = next.catch(() => {});
+  return next;
+};
+const withTransaction = (fn) => enqueueExclusive(async () => {
+  await run("BEGIN IMMEDIATE");
+  try {
+    const result = await fn();
+    await run("COMMIT");
+    return result;
+  } catch (err) {
+    try { await run("ROLLBACK"); } catch (_) {}
+    throw err;
+  }
+});
+
 // --- FILE HANDLING HELPER ---
 // Converts Base64 dataURL to a file on disk and returns the relative path
 const processFile = (base64String, prefix) => {
@@ -143,24 +159,81 @@ const processFile = (base64String, prefix) => {
     }
 };
 
+const deleteUploadedFile = (fileUrl) => {
+    if (typeof fileUrl !== 'string' || !fileUrl.startsWith('/uploads/')) return;
+    try {
+        const filename = path.basename(fileUrl);
+        if (!filename) return;
+        const targetPath = path.join(uploadsDir, filename);
+        if (fs.existsSync(targetPath)) {
+            fs.unlinkSync(targetPath);
+            logSystem('INFO', `Deleted orphaned upload: ${filename}`);
+        }
+    } catch (e) {
+        logSystem('ERROR', `Failed to delete upload ${fileUrl}: ${e.message}`);
+    }
+};
+
+const cleanupRemovedAttachments = (oldList, newList) => {
+    const keptPaths = new Set(
+        (newList || [])
+            .map(a => a && a.data)
+            .filter(d => typeof d === 'string' && d.startsWith('/uploads/'))
+    );
+    (oldList || []).forEach(a => {
+        if (a && typeof a.data === 'string' && a.data.startsWith('/uploads/') && !keptPaths.has(a.data)) {
+            deleteUploadedFile(a.data);
+        }
+    });
+};
+
+// --- ADMIN SESSION AUTH ---
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'administrator';
+const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const adminSessions = new Map();
+
+const verifyAdminPassword = (input) => {
+    const a = crypto.createHash('sha256').update(String(input || '')).digest();
+    const b = crypto.createHash('sha256').update(String(ADMIN_PASSWORD)).digest();
+    return crypto.timingSafeEqual(a, b);
+};
+
+const requireAdmin = (req, res, next) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const expiresAt = adminSessions.get(token);
+    if (!token || !expiresAt || expiresAt <= Date.now()) {
+        if (token) adminSessions.delete(token);
+        return res.status(401).json({ error: 'Admin-Authentifizierung erforderlich.' });
+    }
+    next();
+};
+
 // --- INIT DB ---
 if (db) {
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS vehicles (id TEXT PRIMARY KEY, licensePlate TEXT, type TEXT, manufacturer TEXT, model TEXT, vin TEXT, year INTEGER, notes TEXT, coupledVehicleId TEXT, nextHU TEXT, nextSP TEXT, nextUVV TEXT, nextTacho TEXT, currentMileage INTEGER, registrationDoc TEXT, keyNum21 TEXT, keyNum22 TEXT, maintenanceContract INTEGER, maintenanceContractExpiry TEXT, maintenanceContractType TEXT)`);
-  db.run(`ALTER TABLE vehicles ADD COLUMN isActive INTEGER DEFAULT 1`, (err) => {});
-  db.run(`ALTER TABLE vehicles ADD COLUMN keyNum21 TEXT`, (err) => {});
-  db.run(`ALTER TABLE vehicles ADD COLUMN keyNum22 TEXT`, (err) => {});
-  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContract INTEGER`, (err) => {});
-  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContractExpiry TEXT`, (err) => {});
-  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContractType TEXT`, (err) => {});
-  db.run(`CREATE TABLE IF NOT EXISTS logs (id TEXT PRIMARY KEY, vehicleId TEXT, type TEXT, description TEXT, priority TEXT, dateAdded TEXT, dateCompleted TEXT, status TEXT, mileage INTEGER, inspectionType TEXT, attachments TEXT, notes TEXT, FOREIGN KEY(vehicleId) REFERENCES vehicles(id) ON DELETE CASCADE)`);
-  db.run(`ALTER TABLE logs ADD COLUMN notes TEXT`, (err) => {
+  const logAlterErr = (col) => (err) => {
       if (err && !err.message.includes("duplicate column name")) {
-          logSystem('ERROR', `Failed to add notes column: ${err.message}`);
+          logSystem('ERROR', `Failed to add ${col} column: ${err.message}`);
       }
-  });
-  db.run(`CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, description TEXT, vehicleId TEXT, dateAdded TEXT, status TEXT, supplier TEXT, FOREIGN KEY(vehicleId) REFERENCES vehicles(id) ON DELETE CASCADE)`);
+  };
+  db.run(`ALTER TABLE vehicles ADD COLUMN isActive INTEGER DEFAULT 1`, logAlterErr('isActive'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN keyNum21 TEXT`, logAlterErr('keyNum21'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN keyNum22 TEXT`, logAlterErr('keyNum22'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContract INTEGER`, logAlterErr('maintenanceContract'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContractExpiry TEXT`, logAlterErr('maintenanceContractExpiry'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN maintenanceContractType TEXT`, logAlterErr('maintenanceContractType'));
+  db.run(`ALTER TABLE vehicles ADD COLUMN version INTEGER DEFAULT 1`, logAlterErr('vehicles.version'));
+  db.run(`CREATE TABLE IF NOT EXISTS logs (id TEXT PRIMARY KEY, vehicleId TEXT, type TEXT, description TEXT, priority TEXT, dateAdded TEXT, dateCompleted TEXT, status TEXT, mileage INTEGER, inspectionType TEXT, attachments TEXT, notes TEXT, version INTEGER DEFAULT 1, FOREIGN KEY(vehicleId) REFERENCES vehicles(id) ON DELETE CASCADE)`);
+  db.run(`ALTER TABLE logs ADD COLUMN notes TEXT`, logAlterErr('logs.notes'));
+  db.run(`ALTER TABLE logs ADD COLUMN version INTEGER DEFAULT 1`, logAlterErr('logs.version'));
+  db.run(`CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, description TEXT, vehicleId TEXT, dateAdded TEXT, status TEXT, supplier TEXT, version INTEGER DEFAULT 1, FOREIGN KEY(vehicleId) REFERENCES vehicles(id) ON DELETE CASCADE)`);
+  db.run(`ALTER TABLE orders ADD COLUMN version INTEGER DEFAULT 1`, logAlterErr('orders.version'));
   db.run(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`);
+  db.run("CREATE INDEX IF NOT EXISTS idx_logs_vehicleId ON logs(vehicleId)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_logs_status ON logs(status)");
+  db.run("CREATE INDEX IF NOT EXISTS idx_logs_dateAdded ON logs(dateAdded)");
 });
 }
 
@@ -200,31 +273,61 @@ app.get('/api/vehicles/:id/doc', async (req, res) => {
 app.put('/api/vehicles/:id', async (req, res) => {
   const v = req.body;
   try {
-    // Process File Upload if Base64
     let docPath = v.registrationDoc;
-    if (v.registrationDoc && v.registrationDoc.startsWith('data:')) {
-        docPath = processFile(v.registrationDoc, `doc_${req.params.id}`);
-    }
+    let oldDocToDelete = null;
+    let newVersion = 1;
+    await withTransaction(async () => {
+        const existing = await get("SELECT registrationDoc, COALESCE(version, 1) as version FROM vehicles WHERE id = ?", [req.params.id]);
+        if (existing && typeof v.version === 'number' && existing.version !== v.version) {
+            const err = new Error('Konflikt: Fahrzeug wurde zwischenzeitlich von einem anderen Benutzer geändert. Bitte Daten neu laden.');
+            err.statusCode = 409;
+            throw err;
+        }
+        newVersion = existing ? existing.version + 1 : 1;
 
-    // If registrationDoc is explicitly null/undefined in body, it might mean "don't change". 
-    // But since we stripped it in GET, the frontend might send null back if not edited.
-    // If user deleted it, frontend should send empty string.
-    
-    // Logic: If v.registrationDoc is null, fetch existing to preserve. 
-    // However, if the frontend lazily loaded it, it sends the full string.
-    // To be safe: If v.registrationDoc is null/undefined, we assume NO CHANGE.
-    if (v.registrationDoc === undefined || v.registrationDoc === null) {
-         const existing = await get("SELECT registrationDoc FROM vehicles WHERE id = ?", [req.params.id]);
-         docPath = existing ? existing.registrationDoc : null;
-    }
+        if (v.registrationDoc && v.registrationDoc.startsWith('data:')) {
+            docPath = processFile(v.registrationDoc, `doc_${req.params.id}`);
+        }
 
-    const isActiveVal = v.isActive === false ? 0 : 1;
-    const maintenanceContractVal = v.maintenanceContract ? 1 : 0;
+        if (v.registrationDoc === undefined || v.registrationDoc === null) {
+            docPath = existing ? existing.registrationDoc : null;
+        } else if (existing && existing.registrationDoc && existing.registrationDoc !== docPath) {
+            oldDocToDelete = existing.registrationDoc;
+        }
 
-    await run(`INSERT OR REPLACE INTO vehicles (id, licensePlate, type, manufacturer, model, vin, year, notes, coupledVehicleId, nextHU, nextSP, nextUVV, nextTacho, currentMileage, registrationDoc, isActive, keyNum21, keyNum22, maintenanceContract, maintenanceContractExpiry, maintenanceContractType) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, 
-      [req.params.id, v.licensePlate, v.type, v.manufacturer, v.model, v.vin, v.year, v.notes, v.coupledVehicleId, v.nextHU, v.nextSP, v.nextUVV, v.nextTacho, v.currentMileage, docPath, isActiveVal, v.keyNum21 || null, v.keyNum22 || null, maintenanceContractVal, v.maintenanceContractExpiry || null, v.maintenanceContractType || null]);
-    res.json({ success: true, path: docPath });
-  } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
+        const isActiveVal = v.isActive === false ? 0 : 1;
+        const maintenanceContractVal = v.maintenanceContract ? 1 : 0;
+
+        await run(`INSERT INTO vehicles (id, licensePlate, type, manufacturer, model, vin, year, notes, coupledVehicleId, nextHU, nextSP, nextUVV, nextTacho, currentMileage, registrationDoc, isActive, keyNum21, keyNum22, maintenanceContract, maintenanceContractExpiry, maintenanceContractType, version)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+          ON CONFLICT(id) DO UPDATE SET
+            licensePlate=excluded.licensePlate,
+            type=excluded.type,
+            manufacturer=excluded.manufacturer,
+            model=excluded.model,
+            vin=excluded.vin,
+            year=excluded.year,
+            notes=excluded.notes,
+            coupledVehicleId=excluded.coupledVehicleId,
+            nextHU=excluded.nextHU,
+            nextSP=excluded.nextSP,
+            nextUVV=excluded.nextUVV,
+            nextTacho=excluded.nextTacho,
+            currentMileage=excluded.currentMileage,
+            registrationDoc=excluded.registrationDoc,
+            isActive=excluded.isActive,
+            keyNum21=excluded.keyNum21,
+            keyNum22=excluded.keyNum22,
+            maintenanceContract=excluded.maintenanceContract,
+            maintenanceContractExpiry=excluded.maintenanceContractExpiry,
+            maintenanceContractType=excluded.maintenanceContractType,
+            version=COALESCE(vehicles.version, 1) + 1`,
+          [req.params.id, v.licensePlate, v.type, v.manufacturer, v.model, v.vin, v.year, v.notes, v.coupledVehicleId, v.nextHU, v.nextSP, v.nextUVV, v.nextTacho, v.currentMileage, docPath, isActiveVal, v.keyNum21 || null, v.keyNum22 || null, maintenanceContractVal, v.maintenanceContractExpiry || null, v.maintenanceContractType || null]);
+    });
+
+    if (oldDocToDelete) deleteUploadedFile(oldDocToDelete);
+    res.json({ success: true, path: docPath, version: newVersion });
+  } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method }); res.status(e.statusCode || 500).json({ error: e.message }); }
 });
 
 app.post('/api/vehicles', async (req, res) => {
@@ -238,18 +341,32 @@ app.post('/api/vehicles', async (req, res) => {
     const isActiveVal = v.isActive === false ? 0 : 1;
     const maintenanceContractVal = v.maintenanceContract ? 1 : 0;
     
-    await run(`INSERT INTO vehicles (id, licensePlate, type, manufacturer, model, vin, year, notes, coupledVehicleId, nextHU, nextSP, nextUVV, nextTacho, currentMileage, registrationDoc, isActive, keyNum21, keyNum22, maintenanceContract, maintenanceContractExpiry, maintenanceContractType) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, 
+    await run(`INSERT INTO vehicles (id, licensePlate, type, manufacturer, model, vin, year, notes, coupledVehicleId, nextHU, nextSP, nextUVV, nextTacho, currentMileage, registrationDoc, isActive, keyNum21, keyNum22, maintenanceContract, maintenanceContractExpiry, maintenanceContractType, version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)`, 
       [id, v.licensePlate, v.type, v.manufacturer, v.model, v.vin, v.year, v.notes, v.coupledVehicleId, v.nextHU, v.nextSP, v.nextUVV, v.nextTacho, v.currentMileage, docPath, isActiveVal, v.keyNum21 || null, v.keyNum22 || null, maintenanceContractVal, v.maintenanceContractExpiry || null, v.maintenanceContractType || null]);
-    res.json({ success: true, id, path: docPath });
+    res.json({ success: true, id, path: docPath, version: 1 });
   } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/vehicles/:id', async (req, res) => {
     try {
-        await run("UPDATE vehicles SET coupledVehicleId = NULL WHERE coupledVehicleId = ?", [req.params.id]);
-        await run("DELETE FROM orders WHERE vehicleId = ?", [req.params.id]);
-        await run("DELETE FROM logs WHERE vehicleId = ?", [req.params.id]);
-        await run("DELETE FROM vehicles WHERE id = ?", [req.params.id]);
+        const filesToDelete = [];
+        await withTransaction(async () => {
+            const vRow = await get("SELECT registrationDoc FROM vehicles WHERE id = ?", [req.params.id]);
+            if (vRow && vRow.registrationDoc) filesToDelete.push(vRow.registrationDoc);
+            const logRows = await all("SELECT attachments FROM logs WHERE vehicleId = ?", [req.params.id]);
+            logRows.forEach(r => {
+                try {
+                    const atts = JSON.parse(r.attachments || '[]');
+                    atts.forEach(a => { if (a && a.data) filesToDelete.push(a.data); });
+                } catch (_) {}
+            });
+
+            await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE coupledVehicleId = ?", [req.params.id]);
+            await run("DELETE FROM orders WHERE vehicleId = ?", [req.params.id]);
+            await run("DELETE FROM logs WHERE vehicleId = ?", [req.params.id]);
+            await run("DELETE FROM vehicles WHERE id = ?", [req.params.id]);
+        });
+        filesToDelete.forEach(deleteUploadedFile);
         res.json({ success: true });
     } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
 });
@@ -375,40 +492,75 @@ app.post('/api/logs', async (req, res) => {
         return att;
     });
 
-    await run(`INSERT INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, 
+    await run(`INSERT INTO logs (id, vehicleId, type, description, priority, dateAdded, dateCompleted, status, mileage, inspectionType, attachments, notes, version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)`, 
       [id, l.vehicleId || null, l.type || null, l.description || null, l.priority || null, l.dateAdded || null, l.dateCompleted || null, l.status || 'OPEN', l.mileage || null, l.inspectionType || null, JSON.stringify(processedAttachments), l.notes || null]);
-    res.json({ success: true, id });
+    res.json({ success: true, id, version: 1 });
   } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/logs/:id', async (req, res) => {
   try {
       const l = req.body;
-      const existingRow = await get("SELECT attachments FROM logs WHERE id=?", [req.params.id]);
-      const existingAttachments = existingRow ? JSON.parse(existingRow.attachments || '[]') : [];
-
-      let incomingAttachments = l.attachments || [];
-      const processedAttachments = incomingAttachments.map(att => {
-          if (att.data && att.data.startsWith('data:')) {
-              const filePath = processFile(att.data, `att_${req.params.id}`);
-              return { ...att, data: filePath, hasData: true };
-          } else if (!att.data && att.hasData) {
-              // Existing file or Base64 that was stripped in UI. Find original.
-              const old = existingAttachments.find(ea => ea.name === att.name);
-              return old || att;
+      let oldAttachments = [];
+      let newAttachments = [];
+      let newVersion = 1;
+      await withTransaction(async () => {
+          const existingRow = await get("SELECT attachments, COALESCE(version, 1) as version FROM logs WHERE id=?", [req.params.id]);
+          if (existingRow && typeof l.version === 'number' && existingRow.version !== l.version) {
+              const err = new Error('Konflikt: Eintrag wurde zwischenzeitlich von einem anderen Benutzer geändert. Bitte Daten neu laden.');
+              err.statusCode = 409;
+              throw err;
           }
-          return att;
-      });
+          newVersion = existingRow ? existingRow.version + 1 : 1;
+          oldAttachments = existingRow ? JSON.parse(existingRow.attachments || '[]') : [];
 
-      await run(`INSERT OR REPLACE INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, 
-        [req.params.id, l.vehicleId || null, l.type || null, l.description || null, l.priority || null, l.dateAdded || null, l.dateCompleted || null, l.status || 'OPEN', l.mileage || null, l.inspectionType || null, JSON.stringify(processedAttachments), l.notes || null]);
-      res.json({ success: true });
-  } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
+          let incomingAttachments = l.attachments || [];
+          newAttachments = incomingAttachments.map(att => {
+              if (att.data && att.data.startsWith('data:')) {
+                  const filePath = processFile(att.data, `att_${req.params.id}`);
+                  return { ...att, data: filePath, hasData: true };
+              } else if (!att.data && att.hasData) {
+                  const old = oldAttachments.find(ea => ea.name === att.name);
+                  return old || att;
+              }
+              return att;
+          });
+
+          await run(`INSERT INTO logs (id, vehicleId, type, description, priority, dateAdded, dateCompleted, status, mileage, inspectionType, attachments, notes, version)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)
+            ON CONFLICT(id) DO UPDATE SET
+              vehicleId=excluded.vehicleId,
+              type=excluded.type,
+              description=excluded.description,
+              priority=excluded.priority,
+              dateAdded=excluded.dateAdded,
+              dateCompleted=excluded.dateCompleted,
+              status=excluded.status,
+              mileage=excluded.mileage,
+              inspectionType=excluded.inspectionType,
+              attachments=excluded.attachments,
+              notes=excluded.notes,
+              version=COALESCE(logs.version, 1) + 1`,
+            [req.params.id, l.vehicleId || null, l.type || null, l.description || null, l.priority || null, l.dateAdded || null, l.dateCompleted || null, l.status || 'OPEN', l.mileage || null, l.inspectionType || null, JSON.stringify(newAttachments), l.notes || null]);
+      });
+      cleanupRemovedAttachments(oldAttachments, newAttachments);
+      res.json({ success: true, version: newVersion });
+  } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method }); res.status(e.statusCode || 500).json({ error: e.message }); }
 });
 
 app.delete('/api/logs/:id', async (req, res) => {
-    try { await run("DELETE FROM logs WHERE id=?", [req.params.id]); res.json({success:true}); }
-    catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
+    try {
+        let oldAttachments = [];
+        await withTransaction(async () => {
+            const existingRow = await get("SELECT attachments FROM logs WHERE id=?", [req.params.id]);
+            if (existingRow && existingRow.attachments) {
+                try { oldAttachments = JSON.parse(existingRow.attachments); } catch (_) {}
+            }
+            await run("DELETE FROM logs WHERE id=?", [req.params.id]);
+        });
+        cleanupRemovedAttachments(oldAttachments, []);
+        res.json({success:true});
+    } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
 });
 
 // ORDERS
@@ -418,15 +570,34 @@ app.get('/api/orders', async (req, res) => {
 app.post('/api/orders', async (req, res) => {
     try { 
         const id = req.body.id || crypto.randomUUID();
-        await run("INSERT INTO orders VALUES (?,?,?,?,?,?)", [id, req.body.description || null, req.body.vehicleId || null, req.body.dateAdded || null, req.body.status || null, req.body.supplier || null]);
-        res.json({success:true, id});
+        await run("INSERT INTO orders (id, description, vehicleId, dateAdded, status, supplier, version) VALUES (?,?,?,?,?,?,1)", [id, req.body.description || null, req.body.vehicleId || null, req.body.dateAdded || null, req.body.status || null, req.body.supplier || null]);
+        res.json({success:true, id, version: 1});
     } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
 });
 app.put('/api/orders/:id', async (req, res) => {
     try {
-        await run("INSERT OR REPLACE INTO orders VALUES (?,?,?,?,?,?)", [req.params.id, req.body.description || null, req.body.vehicleId || null, req.body.dateAdded || null, req.body.status || null, req.body.supplier || null]);
-        res.json({success:true});
-    } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); }
+        let newVersion = 1;
+        await withTransaction(async () => {
+            const existing = await get("SELECT COALESCE(version, 1) as version FROM orders WHERE id = ?", [req.params.id]);
+            if (existing && typeof req.body.version === 'number' && existing.version !== req.body.version) {
+                const err = new Error('Konflikt: Bestellung wurde zwischenzeitlich von einem anderen Benutzer geändert. Bitte Daten neu laden.');
+                err.statusCode = 409;
+                throw err;
+            }
+            newVersion = existing ? existing.version + 1 : 1;
+            await run(`INSERT INTO orders (id, description, vehicleId, dateAdded, status, supplier, version)
+              VALUES (?,?,?,?,?,?,1)
+              ON CONFLICT(id) DO UPDATE SET
+                description=excluded.description,
+                vehicleId=excluded.vehicleId,
+                dateAdded=excluded.dateAdded,
+                status=excluded.status,
+                supplier=excluded.supplier,
+                version=COALESCE(orders.version, 1) + 1`,
+              [req.params.id, req.body.description || null, req.body.vehicleId || null, req.body.dateAdded || null, req.body.status || null, req.body.supplier || null]);
+        });
+        res.json({success:true, version: newVersion});
+    } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method }); res.status(e.statusCode || 500).json({ error: e.message }); }
 });
 app.delete('/api/orders/:id', async (req, res) => {
     try { await run("DELETE FROM orders WHERE id=?", [req.params.id]); res.json({success:true}); }
@@ -436,11 +607,9 @@ app.delete('/api/orders/:id', async (req, res) => {
 // TRANSACTIONS
 app.post('/api/transaction/complete-task', async (req, res) => {
     const { logId, vehicleId, mileage, logData } = req.body;
-    db.serialize(() => {
-        db.run("BEGIN");
-        db.get("SELECT attachments FROM logs WHERE id=?", [logId], (err, existingRow) => {
-            if(err) { db.run("ROLLBACK"); return res.status(500).json({error:err.message}); }
-            
+    try {
+        await withTransaction(async () => {
+            const existingRow = await get("SELECT attachments FROM logs WHERE id=?", [logId]);
             let existingAttachments = [];
             try {
                 if (existingRow && existingRow.attachments) {
@@ -457,7 +626,7 @@ app.post('/api/transaction/complete-task', async (req, res) => {
                     incomingAttachments = [];
                 }
             }
-            
+
             const processedAttachments = incomingAttachments.map(att => {
                 if (att.data && att.data.startsWith('data:')) {
                     const filePath = processFile(att.data, `att_${logId}`);
@@ -470,36 +639,54 @@ app.post('/api/transaction/complete-task', async (req, res) => {
             });
 
             const attStr = JSON.stringify(processedAttachments);
-            db.run("INSERT OR REPLACE INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [logId, logData.vehicleId || null, logData.type || null, logData.description || null, logData.priority || null, logData.dateAdded || null, logData.dateCompleted || null, 'DONE', mileage || null, logData.inspectionType || null, attStr, logData.notes || null], (err) => {
-                if(err) { db.run("ROLLBACK"); return res.status(500).json({error:err.message}); }
-                db.get("SELECT currentMileage FROM vehicles WHERE id=?", [vehicleId], (err, row) => {
-                    if(row && mileage > (row.currentMileage||0)) {
-                        db.run("UPDATE vehicles SET currentMileage=? WHERE id=?", [mileage, vehicleId], (err) => {
-                            if(err) { db.run("ROLLBACK"); return res.status(500).json({error:err.message}); }
-                            db.run("COMMIT"); res.json({success:true});
-                        });
-                    } else { db.run("COMMIT"); res.json({success:true}); }
-                });
-            });
+            await run(`INSERT INTO logs (id, vehicleId, type, description, priority, dateAdded, dateCompleted, status, mileage, inspectionType, attachments, notes, version)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)
+                ON CONFLICT(id) DO UPDATE SET
+                  vehicleId=excluded.vehicleId,
+                  type=excluded.type,
+                  description=excluded.description,
+                  priority=excluded.priority,
+                  dateAdded=excluded.dateAdded,
+                  dateCompleted=excluded.dateCompleted,
+                  status=excluded.status,
+                  mileage=excluded.mileage,
+                  inspectionType=excluded.inspectionType,
+                  attachments=excluded.attachments,
+                  notes=excluded.notes,
+                  version=COALESCE(logs.version, 1) + 1`,
+                [logId, logData.vehicleId || null, logData.type || null, logData.description || null, logData.priority || null, logData.dateAdded || null, logData.dateCompleted || null, 'DONE', mileage || null, logData.inspectionType || null, attStr, logData.notes || null]);
+
+            if (vehicleId) {
+                const row = await get("SELECT currentMileage FROM vehicles WHERE id=?", [vehicleId]);
+                if (row && mileage > (row.currentMileage || 0)) {
+                    await run("UPDATE vehicles SET currentMileage=?, version = COALESCE(version, 1) + 1 WHERE id=?", [mileage, vehicleId]);
+                }
+            }
+            cleanupRemovedAttachments(existingAttachments, processedAttachments);
         });
-    });
+        res.json({ success: true });
+    } catch (e) {
+        logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method });
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.post('/api/transaction/complete-inspection', async (req, res) => {
     const { logData, nextDate } = req.body;
-    const logId = logData.id || crypto.randomUUID();
+    const logId = logData?.id || crypto.randomUUID();
     const validTypes = ['HU', 'SP', 'UVV', 'Tacho'];
-    if (!validTypes.includes(logData.inspectionType)) {
-        return res.status(400).json({error: 'Invalid inspection type'});
+    if (!logData || !validTypes.includes(logData.inspectionType)) {
+        return res.status(400).json({ error: 'Invalid inspection type' });
     }
     const colName = `next${logData.inspectionType}`;
-    
+
     if (!nextDate || typeof nextDate !== 'string') {
-        return res.status(400).json({error: 'Invalid or missing nextDate'});
+        return res.status(400).json({ error: 'Invalid or missing nextDate' });
     }
     let y, m;
-    if (nextDate.includes('-')) {
-        const parts = nextDate.split('-');
+    const trimmed = nextDate.trim();
+    if (trimmed.includes('-')) {
+        const parts = trimmed.split('-');
         if (parts[0].length === 4) {
             y = parts[0];
             m = parts[1];
@@ -507,42 +694,128 @@ app.post('/api/transaction/complete-inspection', async (req, res) => {
             m = parts[0];
             y = parts[1];
         }
-    } else if (nextDate.includes('/')) {
-        const parts = nextDate.split('/');
+    } else if (trimmed.includes('/')) {
+        const parts = trimmed.split('/');
         m = parts[0];
         y = parts[1];
-    } else if (nextDate.includes('.')) {
-        const parts = nextDate.split('.');
+    } else if (trimmed.includes('.')) {
+        const parts = trimmed.split('.');
         m = parts[0];
         y = parts[1];
     } else {
-        // Fallback
-        y = new Date().getFullYear().toString();
-        m = '01';
+        return res.status(400).json({ error: 'Ungültiges Datumsformat. Erwartet wird MM/JJJJ.' });
     }
-    if (m) m = m.padStart(2, '0');
-    if (y && y.length === 2) y = '20' + y;
-    const formattedDate = `${m}/${y}`;
-    
-    db.serialize(() => {
-        db.run("BEGIN");
-        db.run("INSERT INTO logs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [logId, logData.vehicleId || null, 'Wartung', logData.description || null, 'Normal', logData.dateAdded || null, logData.dateCompleted || null, 'DONE', null, logData.inspectionType || null, '[]', logData.notes || null], (err) => {
-            if(err) { db.run("ROLLBACK"); return res.status(500).json({error:err.message}); }
-            db.run(`UPDATE vehicles SET ${colName}=? WHERE id=?`, [formattedDate, logData.vehicleId], (err) => {
-                 if(err) { db.run("ROLLBACK"); return res.status(500).json({error:err.message}); }
-                 db.run("COMMIT"); res.json({success:true});
-            });
+
+    const monthNum = parseInt(m, 10);
+    if (y && y.length === 2 && /^\d{2}$/.test(y)) y = '20' + y;
+    const yearNum = parseInt(y, 10);
+
+    if (!m || !y || isNaN(monthNum) || isNaN(yearNum) || monthNum < 1 || monthNum > 12 || yearNum < 1900 || yearNum > 2100 || !/^\d{4}$/.test(y)) {
+        return res.status(400).json({ error: 'Ungültiges Datum. Erwartet wird ein gültiger Monat (01-12) und ein vierstelliges Jahr.' });
+    }
+    const formattedDate = `${String(monthNum).padStart(2, '0')}/${y}`;
+
+    try {
+        await withTransaction(async () => {
+            await run("INSERT INTO logs (id, vehicleId, type, description, priority, dateAdded, dateCompleted, status, mileage, inspectionType, attachments, notes, version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                [logId, logData.vehicleId || null, 'Wartung', logData.description || null, 'Normal', logData.dateAdded || null, logData.dateCompleted || null, 'DONE', null, logData.inspectionType || null, '[]', logData.notes || null]);
+            await run(`UPDATE vehicles SET ${colName}=?, version = COALESCE(version, 1) + 1 WHERE id=?`, [formattedDate, logData.vehicleId]);
         });
-    });
+        res.json({ success: true });
+    } catch (e) {
+        logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method });
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/transaction/couple', async (req, res) => {
+    const { motorId, trailerId } = req.body || {};
+    if (!motorId || !trailerId || motorId === trailerId) {
+        return res.status(400).json({ error: 'Ungültige Fahrzeugauswahl zum Koppeln.' });
+    }
+    try {
+        await withTransaction(async () => {
+            const motor = await get("SELECT id, isActive, coupledVehicleId FROM vehicles WHERE id = ?", [motorId]);
+            const trailer = await get("SELECT id, isActive, coupledVehicleId FROM vehicles WHERE id = ?", [trailerId]);
+            if (!motor || !trailer) {
+                const err = new Error('Mindestens ein Fahrzeug wurde nicht gefunden.');
+                err.statusCode = 404;
+                throw err;
+            }
+            if (motor.isActive === 0 || trailer.isActive === 0) {
+                const err = new Error('Inaktive Fahrzeuge können nicht gekoppelt werden.');
+                err.statusCode = 400;
+                throw err;
+            }
+            if (motor.coupledVehicleId) {
+                await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE id = ?", [motor.coupledVehicleId]);
+            }
+            if (trailer.coupledVehicleId) {
+                await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE id = ?", [trailer.coupledVehicleId]);
+            }
+            await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE coupledVehicleId IN (?, ?)", [motorId, trailerId]);
+            await run("UPDATE vehicles SET coupledVehicleId = ?, version = COALESCE(version, 1) + 1 WHERE id = ?", [trailerId, motorId]);
+            await run("UPDATE vehicles SET coupledVehicleId = ?, version = COALESCE(version, 1) + 1 WHERE id = ?", [motorId, trailerId]);
+        });
+        res.json({ success: true });
+    } catch (e) {
+        logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method });
+        res.status(e.statusCode || 500).json({ error: e.message });
+    }
+});
+
+app.post('/api/transaction/uncouple', async (req, res) => {
+    const { motorId, trailerId } = req.body || {};
+    if (!motorId && !trailerId) {
+        return res.status(400).json({ error: 'Keine Fahrzeug-ID zum Trennen angegeben.' });
+    }
+    try {
+        await withTransaction(async () => {
+            if (motorId) {
+                await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE id = ? OR coupledVehicleId = ?", [motorId, motorId]);
+            }
+            if (trailerId) {
+                await run("UPDATE vehicles SET coupledVehicleId = NULL, version = COALESCE(version, 1) + 1 WHERE id = ? OR coupledVehicleId = ?", [trailerId, trailerId]);
+            }
+        });
+        res.json({ success: true });
+    } catch (e) {
+        logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method });
+        res.status(500).json({ error: e.message });
+    }
 });
 
 
-app.get('/api/admin/db-stats', (req,res) => { try { const s = fs.statSync(dbPath); res.json({size: (s.size/1024/1024).toFixed(2)+' MB'}); } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); } });
-app.get('/api/admin/logs', (req,res) => { if(fs.existsSync(LOG_FILE)) res.json({logs: fs.readFileSync(LOG_FILE, 'utf8')}); else res.json({logs:''}); });
-app.delete('/api/admin/logs', (req,res) => { fs.truncateSync(LOG_FILE, 0); res.json({success:true}); });
+app.post('/api/admin/login', (req, res) => {
+    const password = req.body?.password;
+    if (!verifyAdminPassword(password)) {
+        return res.status(401).json({ error: 'Falsches Admin-Passwort.' });
+    }
+    const token = crypto.randomBytes(32).toString('hex');
+    adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+    res.json({ success: true, token });
+});
+app.get('/api/admin/db-stats', requireAdmin, (req,res) => { try { const s = fs.statSync(dbPath); res.json({size: (s.size/1024/1024).toFixed(2)+' MB'}); } catch (e) { logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method, body: req.body }); res.status(500).json({ error: e.message }); } });
+app.post('/api/admin/db-vacuum', requireAdmin, async (req, res) => {
+    try {
+        await enqueueExclusive(() => run("VACUUM"));
+        logSystem('INFO', 'Database VACUUM completed');
+        res.json({ success: true });
+    } catch (e) {
+        logSystem('ERROR', e.message, { stack: e.stack, url: req.url, method: req.method });
+        res.status(500).json({ error: e.message });
+    }
+});
+app.get('/api/admin/logs', requireAdmin, (req,res) => { if(fs.existsSync(LOG_FILE)) res.json({logs: fs.readFileSync(LOG_FILE, 'utf8')}); else res.json({logs:''}); });
+app.delete('/api/admin/logs', requireAdmin, (req,res) => { if (fs.existsSync(LOG_FILE)) fs.truncateSync(LOG_FILE, 0); res.json({success:true}); });
 app.post('/api/admin/client-error', (req, res) => {
     logSystem('ERROR', 'Client-side error reported', req.body);
     res.json({ success: true });
+});
+
+// Return JSON 404 for unknown /api routes so frontend does not confuse them with SPA HTML fallback
+app.use('/api', (req, res) => {
+    res.status(404).json({ error: `API endpoint not found: ${req.method} ${req.originalUrl}` });
 });
 
 // Vite middleware for development

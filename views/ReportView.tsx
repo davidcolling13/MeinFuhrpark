@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 import { useQuery, keepPreviousData } from '@tanstack/react-query';
 import { LogEntry, Vehicle, VehicleType } from '../types';
 import { Icons } from '../icons';
-import { api } from '../api';
+import { api, getAdminToken, setAdminToken } from '../api';
 import { useFleet } from '../context/FleetContext';
 import { toast } from 'sonner';
 
@@ -153,40 +153,117 @@ export const HistoryView = ({ onEdit }: any) => {
 };
 
 export const AdminView = () => {
-    // ... [Admin View Implementation remains largely same, just imported api handles things]
-    // Shortened for brevity as logic didn't change, just imports
-    // Assuming previous AdminView logic works with the new API layer implicitly.
-    // Re-implementing simplified version to ensure no compilation errors:
-    
     const [systemLogs, setSystemLogs] = useState('');
-    const [isAuthenticated, setIsAuthenticated] = useState(false);
+    const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(getAdminToken()));
     const [passwordInput, setPasswordInput] = useState('');
+    const [isLoggingIn, setIsLoggingIn] = useState(false);
 
-    const fetchLogs = async () => { try { const data = await api.get('/admin/logs'); setSystemLogs(data.logs || ''); } catch(e) {} };
-    const handleVacuum = async () => { try { await api.post('/admin/db-vacuum', {}); toast.success('Optimiert.'); } catch(e) {} };
-    
+    const handleUnauthorized = () => {
+        setAdminToken(null);
+        setIsAuthenticated(false);
+        setSystemLogs('');
+        toast.error('Admin-Sitzung abgelaufen. Bitte erneut anmelden.');
+    };
+
+    const fetchLogs = async () => {
+        try {
+            const data = await api.get('/admin/logs');
+            setSystemLogs(data.logs || '');
+        } catch (e: any) {
+            if (e?.status === 401) {
+                handleUnauthorized();
+            } else {
+                toast.error(e?.message || 'Fehler beim Laden der Logs.');
+            }
+        }
+    };
+
+    const handleVacuum = async () => {
+        try {
+            await api.post('/admin/db-vacuum', {});
+            toast.success('Datenbank optimiert.');
+        } catch (e: any) {
+            if (e?.status === 401) {
+                handleUnauthorized();
+            } else {
+                toast.error(e?.message || 'Datenbank-Optimierung fehlgeschlagen.');
+            }
+        }
+    };
+
+    const handleLogin = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!passwordInput.trim() || isLoggingIn) return;
+        setIsLoggingIn(true);
+        try {
+            const res = await api.post('/admin/login', { password: passwordInput });
+            if (res?.token) {
+                setAdminToken(res.token);
+                setIsAuthenticated(true);
+                setPasswordInput('');
+                await fetchLogs();
+            } else {
+                toast.error('Anmeldung fehlgeschlagen.');
+            }
+        } catch (err: any) {
+            toast.error(err?.message || 'Ungültiges Passwort.');
+        } finally {
+            setIsLoggingIn(false);
+        }
+    };
+
+    const handleLogout = () => {
+        setAdminToken(null);
+        setIsAuthenticated(false);
+        setSystemLogs('');
+    };
+
+    useEffect(() => {
+        if (isAuthenticated) {
+            fetchLogs();
+        }
+    }, []);
+
     if (!isAuthenticated) return (
-        <div className="p-8 max-w-sm mx-auto bg-white rounded shadow border border-gray-200 mt-10">
+        <form onSubmit={handleLogin} className="p-8 max-w-sm mx-auto bg-white rounded shadow border border-gray-200 mt-10">
             <h3 className="font-bold mb-4">Admin Login</h3>
-            <input type="password" value={passwordInput} onChange={e => setPasswordInput(e.target.value)} className="border w-full p-2 rounded mb-2" placeholder="Passwort" />
-            <button onClick={() => { if(passwordInput === 'administrator') { setIsAuthenticated(true); fetchLogs(); } }} className="bg-blue-600 text-white w-full py-2 rounded font-bold">Login</button>
-        </div>
+            <input
+                type="password"
+                value={passwordInput}
+                onChange={e => setPasswordInput(e.target.value)}
+                className="border w-full p-2 rounded mb-3 outline-none focus:border-blue-500"
+                placeholder="Passwort"
+                autoFocus
+            />
+            <button
+                type="submit"
+                disabled={isLoggingIn || !passwordInput}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 text-white w-full py-2 rounded font-bold transition-colors"
+            >
+                {isLoggingIn ? 'Anmelden...' : 'Login'}
+            </button>
+        </form>
     );
 
     return (
         <div className="space-y-6">
-            <h2 className="text-2xl font-bold text-gray-800">Admin Bereich</h2>
+            <div className="flex items-center justify-between">
+                <h2 className="text-2xl font-bold text-gray-800">Admin Bereich</h2>
+                <button onClick={handleLogout} className="text-sm text-gray-600 hover:text-gray-900 border border-gray-300 px-3 py-1 rounded bg-white hover:bg-gray-50">
+                    Abmelden
+                </button>
+            </div>
             <div className="grid grid-cols-2 gap-4">
                  <div className="bg-white p-4 rounded shadow border">
                     <h4 className="font-bold mb-2">Datenbank</h4>
-                    <button onClick={handleVacuum} className="bg-blue-600 text-white px-3 py-1 rounded text-sm">DB Optimieren</button>
+                    <button onClick={handleVacuum} className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm">DB Optimieren</button>
                  </div>
                  <div className="bg-white p-4 rounded shadow border">
                     <h4 className="font-bold mb-2">Logs</h4>
-                    <button onClick={fetchLogs} className="bg-gray-200 text-gray-800 px-3 py-1 rounded text-sm">Logs laden</button>
+                    <button onClick={fetchLogs} className="bg-gray-200 hover:bg-gray-300 text-gray-800 px-3 py-1 rounded text-sm">Logs laden</button>
                  </div>
             </div>
-            <div className="bg-slate-900 text-slate-100 p-4 rounded text-xs font-mono h-96 overflow-auto">{systemLogs}</div>
+            <div className="bg-slate-900 text-slate-100 p-4 rounded text-xs font-mono h-96 overflow-auto whitespace-pre-wrap">{systemLogs || 'Keine Log-Einträge vorhanden.'}</div>
         </div>
     );
 };

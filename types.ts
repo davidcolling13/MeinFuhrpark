@@ -57,6 +57,7 @@ export interface Vehicle {
   registrationDoc?: string | null; // Base64 PDF Data or Path. Null in List View.
   hasDoc?: boolean | number; // Flag from optimized API to indicate doc exists
   isActive?: boolean; // Aktiv-Status
+  version?: number;
 }
 
 export interface LogEntry {
@@ -79,6 +80,7 @@ export interface LogEntry {
   // Frontend specific
   isVirtual?: boolean; // If true, this is a generated inspection task, not saved in DB yet
   notes?: string;
+  version?: number;
 }
 
 export interface Order {
@@ -88,4 +90,5 @@ export interface Order {
   dateAdded: string;
   status: OrderStatus;
   supplier?: string;
+  version?: number;
 }

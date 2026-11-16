@@ -4,7 +4,7 @@ import { toast } from 'sonner';
 import { ModalOverlay } from './Common';
 import { Vehicle, VehicleType, Priority, OrderStatus } from '../types';
 import { Icons } from '../icons';
-import { getTodayDate, fromInputFormat, getVehicleTypePriority, groupVehiclesByType } from '../utils';
+import { getTodayDate, fromInputFormat, isValidMMYYYY, getVehicleTypePriority, groupVehiclesByType } from '../utils';
 import { api } from '../api';
 
 // --- HELPER ---
@@ -42,9 +42,11 @@ export const VehicleModal = ({ isOpen, onClose, vehicle, onSave }: any) => {
         ...vehicle
     });
     const [loadingDoc, setLoadingDoc] = useState(false);
+    const [confirmRemoveDoc, setConfirmRemoveDoc] = useState(false);
 
     useEffect(() => { 
         if (isOpen) {
+            setConfirmRemoveDoc(false);
             setFormData({ 
                 type: VehicleType.PKW, 
                 licensePlate: '',
@@ -89,17 +91,12 @@ export const VehicleModal = ({ isOpen, onClose, vehicle, onSave }: any) => {
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (file) {
+            setConfirmRemoveDoc(false);
             const reader = new FileReader();
             reader.onloadend = () => {
                 setFormData(prev => ({ ...prev, registrationDoc: reader.result as string }));
             };
             reader.readAsDataURL(file);
-        }
-    };
-
-    const handleRemoveFile = () => {
-        if(confirm('Möchten Sie das hinterlegte Dokument wirklich entfernen?')) {
-            setFormData(prev => ({ ...prev, registrationDoc: '' }));
         }
     };
 
@@ -112,7 +109,7 @@ export const VehicleModal = ({ isOpen, onClose, vehicle, onSave }: any) => {
                     {/* Stammdaten */}
                     <div className="flex items-center justify-between">
                         <div className="flex-1 mr-4">
-                            <label className="block text-sm font-bold text-gray-700 mb-1">Kennzeichen</label>
+                            <label className="block text-sm font-bold text-gray-700 mb-1">Kennzeichen <span className="text-red-500">*</span></label>
                             <input 
                                 className="w-full border border-gray-300 p-2 rounded focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none" 
                                 placeholder="z.B. M-AB 123"
@@ -226,13 +223,37 @@ export const VehicleModal = ({ isOpen, onClose, vehicle, onSave }: any) => {
                                 <div className="text-xs text-green-700 font-bold flex items-center gap-2">
                                     <Icons.Check /> Dokument hinterlegt
                                 </div>
-                                <button 
-                                    onClick={handleRemoveFile}
-                                    className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-colors flex items-center gap-1 text-xs font-bold"
-                                    title="Dokument löschen"
-                                >
-                                    <Icons.Trash /> Löschen
-                                </button>
+                                {confirmRemoveDoc ? (
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-red-700 font-medium">Wirklich entfernen?</span>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setFormData(prev => ({ ...prev, registrationDoc: '' }));
+                                                setConfirmRemoveDoc(false);
+                                            }}
+                                            className="bg-red-600 text-white hover:bg-red-700 px-2.5 py-1 rounded text-xs font-bold transition-colors"
+                                        >
+                                            Entfernen
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setConfirmRemoveDoc(false)}
+                                            className="text-gray-600 hover:bg-gray-100 px-2 py-1 rounded text-xs font-medium transition-colors"
+                                        >
+                                            Abbrechen
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <button 
+                                        type="button"
+                                        onClick={() => setConfirmRemoveDoc(true)}
+                                        className="text-red-500 hover:text-red-700 hover:bg-red-50 p-1.5 rounded transition-colors flex items-center gap-1 text-xs font-bold"
+                                        title="Dokument löschen"
+                                    >
+                                        <Icons.Trash /> Löschen
+                                    </button>
+                                )}
                             </div>
                         )}
                     </div>
@@ -356,7 +377,33 @@ export const VehicleModal = ({ isOpen, onClose, vehicle, onSave }: any) => {
 
                 <div className="mt-6 flex justify-end gap-3 pt-4 border-t border-gray-100">
                     <button onClick={onClose} className="px-5 py-2 text-gray-600 hover:bg-gray-100 rounded font-medium">Abbrechen</button>
-                    <button onClick={() => onSave(formData as Vehicle)} className="px-5 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 font-bold shadow-sm">Speichern</button>
+                    <button onClick={() => {
+                        const trimmedPlate = (formData.licensePlate || '').trim();
+                        if (!trimmedPlate) {
+                            toast.warning('Bitte geben Sie ein Kennzeichen ein.');
+                            return;
+                        }
+                        const dateFields: { key: keyof Vehicle; label: string }[] = [
+                            { key: 'nextHU', label: 'Nächste HU' },
+                            { key: 'nextSP', label: 'Nächste SP' },
+                            { key: 'nextUVV', label: 'Nächste UVV' },
+                            { key: 'nextTacho', label: 'Nächste Tacho' },
+                            { key: 'maintenanceContractExpiry', label: 'Ablaufdatum Wartungsvertrag' }
+                        ];
+                        const normalized = { ...formData, licensePlate: trimmedPlate };
+                        for (const f of dateFields) {
+                            const raw = (normalized[f.key] as string | undefined)?.trim();
+                            if (raw) {
+                                const formatted = fromInputFormat(raw);
+                                if (!isValidMMYYYY(formatted)) {
+                                    toast.warning(`Bitte geben Sie für "${f.label}" ein gültiges Datum im Format MM/JJJJ ein.`);
+                                    return;
+                                }
+                                (normalized as any)[f.key] = formatted;
+                            }
+                        }
+                        onSave(normalized as Vehicle);
+                    }} className="px-5 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 font-bold shadow-sm">Speichern</button>
                 </div>
             </div>
         </ModalOverlay>
@@ -396,7 +443,14 @@ export const InspectionModal = ({ isOpen, onClose, log, onSave }: any) => {
                 <div className="flex justify-end gap-3">
                     <button onClick={onClose} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded font-medium">Abbrechen</button>
                     <button 
-                        onClick={() => { if(nextDate) onSave(log, fromInputFormat(nextDate)); else toast.warning('Bitte wählen Sie den nächsten Termin aus.'); }} 
+                        onClick={() => {
+                            const formatted = fromInputFormat(nextDate);
+                            if (!formatted || !isValidMMYYYY(formatted)) {
+                                toast.warning('Bitte geben Sie ein gültiges Datum im Format MM/JJJJ ein.');
+                                return;
+                            }
+                            onSave(log, formatted);
+                        }} 
                         disabled={!nextDate}
                         className={`px-4 py-2 text-white rounded font-bold shadow-sm ${!nextDate ? 'bg-gray-300 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}
                     >
@@ -508,7 +562,7 @@ export const EntryModal = ({ isOpen, onClose, entry, vehicles, onSave }: any) =>
         const type = header.type;
         const mileageVal = parseInt(header.mileage) || 0;
         const newEntries = items.map(item => ({
-            ...(item.id ? { id: item.id } : {}), 
+            ...(item.id ? { id: item.id, ...(entry?.version !== undefined ? { version: entry.version } : {}) } : {}), 
             vehicleId: header.vehicleId,
             dateAdded: header.dateAdded,
             type: type,
@@ -655,7 +709,7 @@ export const OrderModal = ({ isOpen, onClose, order, onSave, vehicles }: any) =>
             if(item.priority === 'dringend') desc += ' [Dringend]';
             if(item.priority === 'niedrig') desc += ' [Niedrig]';
             return {
-                ...(order ? { id: order.id } : {}),
+                ...(order ? { id: order.id, ...(order.version !== undefined ? { version: order.version } : {}) } : {}),
                 vehicleId: header.vehicleId,
                 dateAdded: header.dateAdded,
                 description: desc,

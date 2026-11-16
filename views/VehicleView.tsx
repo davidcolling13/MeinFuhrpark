@@ -1,16 +1,25 @@
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { toast } from 'sonner';
 import { Vehicle, VehicleType } from '../types';
 import { Icons } from '../icons';
 import { getVehicleTypePriority, parseDateMMYYYY } from '../utils';
-import { DateCell } from '../components/Common';
+import { DateCell, ModalOverlay } from '../components/Common';
 import { useFleet } from '../context/FleetContext';
 import { api } from '../api';
 
 export const VehicleListView = ({ onEdit, onAdd }: any) => {
   const { vehicles, deleteVehicle } = useFleet();
   const [loadingDoc, setLoadingDoc] = useState<string | null>(null);
+  const [docPreview, setDocPreview] = useState<{ url: string; title: string; isBlob: boolean } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (docPreview?.isBlob) {
+        URL.revokeObjectURL(docPreview.url);
+      }
+    };
+  }, [docPreview]);
   
   const [sortConfig, setSortConfig] = useState<{ key: string | null, direction: 'asc' | 'desc' }>({ key: null, direction: 'asc' });
   const [filters, setFilters] = useState<{ [key: string]: string }>({});
@@ -79,7 +88,7 @@ export const VehicleListView = ({ onEdit, onAdd }: any) => {
      return sortConfig.direction === 'asc' ? <span className="text-blue-600"><Icons.SortAsc /></span> : <span className="text-blue-600"><Icons.SortDesc /></span>;
   };
 
-  const handleOpenDoc = async (vehicleId: string) => {
+  const handleOpenDoc = async (vehicleId: string, licensePlate?: string) => {
       setLoadingDoc(vehicleId);
       try {
         const res = await api.get(`/vehicles/${vehicleId}/doc`);
@@ -88,12 +97,11 @@ export const VehicleListView = ({ onEdit, onAdd }: any) => {
             return;
         }
         
-        let url = '';
+        const title = licensePlate ? `Fahrzeugschein – ${licensePlate}` : 'Fahrzeugschein';
         // Check if it's a file path (starts with /uploads) or Base64 (starts with data:)
         if (res.doc.startsWith('/uploads')) {
             // It's a file path served statically
-            url = res.doc; 
-            window.open(url, '_blank');
+            setDocPreview({ url: res.doc, title, isBlob: false });
         } else {
             // Legacy Base64 handling
             let base64Part = res.doc;
@@ -109,8 +117,8 @@ export const VehicleListView = ({ onEdit, onAdd }: any) => {
             const bytes = new Uint8Array(len);
             for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
             const blob = new Blob([bytes], { type: mimeType });
-            url = URL.createObjectURL(blob);
-            window.open(url, '_blank');
+            const url = URL.createObjectURL(blob);
+            setDocPreview({ url, title, isBlob: true });
         }
       } catch (e) {
         console.error("Doc Open Error:", e);
@@ -173,10 +181,10 @@ export const VehicleListView = ({ onEdit, onAdd }: any) => {
                   {/* Show button if explicit registrationDoc is present OR hasDoc flag is set */}
                   {(v.registrationDoc || v.hasDoc) && (
                       <button 
-                        onClick={() => handleOpenDoc(v.id)} 
+                        onClick={() => handleOpenDoc(v.id, v.licensePlate)} 
                         disabled={loadingDoc === v.id}
                         className={`p-1.5 rounded ${loadingDoc === v.id ? 'text-blue-500 animate-pulse' : 'text-gray-500 hover:bg-gray-100'}`}
-                        title="Fahrzeugschein öffnen (Neuer Tab)"
+                        title="Fahrzeugschein anzeigen"
                       >
                          {loadingDoc === v.id ? <Icons.Clock /> : (
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><path d="M10 13H8"/><path d="M16 13h-2.5"/></svg>
@@ -190,6 +198,35 @@ export const VehicleListView = ({ onEdit, onAdd }: any) => {
           </tbody>
         </table>
       </div>
+      <ModalOverlay isOpen={!!docPreview} onClose={() => setDocPreview(null)} maxWidth="max-w-5xl">
+        {docPreview && (
+          <div className="p-4 flex flex-col">
+            <div className="flex items-center justify-between border-b border-gray-200 pb-3 mb-3">
+              <h3 className="text-lg font-bold text-gray-800">{docPreview.title}</h3>
+              <div className="flex items-center gap-2">
+                <a
+                  href={docPreview.url}
+                  download="Fahrzeugschein.pdf"
+                  className="px-3 py-1.5 text-sm font-medium text-blue-600 hover:bg-blue-50 rounded border border-blue-200"
+                >
+                  Herunterladen
+                </a>
+                <button
+                  onClick={() => setDocPreview(null)}
+                  className="px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-100 rounded"
+                >
+                  Schließen
+                </button>
+              </div>
+            </div>
+            <iframe
+              src={docPreview.url}
+              title={docPreview.title}
+              className="w-full h-[75vh] bg-gray-100 rounded border border-gray-200"
+            />
+          </div>
+        )}
+      </ModalOverlay>
     </div>
   );
 };

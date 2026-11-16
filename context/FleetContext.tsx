@@ -1,16 +1,17 @@
 
-import { createContext, useContext, ReactNode } from 'react';
+import { createContext, useContext, ReactNode, useState, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 import { Vehicle, LogEntry, Order, OrderStatus } from '../types';
 import { api } from '../api';
 import { getTodayDate } from '../utils';
+import { ModalOverlay } from '../components/Common';
 
 interface FleetContextType {
     vehicles: Vehicle[];
     logs: LogEntry[]; // Contains ACTIVE tasks only for Dashboard
     orders: Order[];
     loading: boolean;
-    error: string | null;
     refetchAll: () => void;
     
     saveVehicle: (v: Vehicle) => Promise<boolean>;
@@ -25,7 +26,7 @@ interface FleetContextType {
     completeInspection: (log: LogEntry, nextDate: string) => Promise<boolean>;
     
     saveOrder: (ordersList: any[]) => Promise<boolean>;
-    updateOrderStatus: (id: string, status: OrderStatus) => Promise<void>;
+    updateOrderStatus: (id: string, status: OrderStatus, supplier?: string) => Promise<void>;
     deleteOrder: (id: string) => Promise<boolean>;
 }
 
@@ -38,7 +39,8 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
     const vehiclesQuery = useQuery({
         queryKey: ['vehicles'],
         queryFn: () => api.get('/vehicles'),
-        initialData: []
+        initialData: [],
+        initialDataUpdatedAt: 0
     });
 
     // 2. Active Logs Query (Optimized for Dashboard)
@@ -50,18 +52,19 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
             // If API returns paginated structure, extract data. Else assume array.
             return res.data || res || []; 
         },
-        initialData: []
+        initialData: [],
+        initialDataUpdatedAt: 0
     });
 
     // 3. Orders Query
     const ordersQuery = useQuery({
         queryKey: ['orders'],
         queryFn: () => api.get('/orders'),
-        initialData: []
+        initialData: [],
+        initialDataUpdatedAt: 0
     });
 
     const loading = vehiclesQuery.isLoading || logsQuery.isLoading || ordersQuery.isLoading;
-    const error = (vehiclesQuery.error || logsQuery.error || ordersQuery.error) ? "Fehler beim Laden" : null;
 
     const refetchAll = () => {
         queryClient.invalidateQueries();
@@ -81,32 +84,19 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
             queryClient.invalidateQueries({ queryKey: ['logs'] }); // Cascade delete affects logs
             queryClient.invalidateQueries({ queryKey: ['orders'] });
             queryClient.invalidateQueries({ queryKey: ['history'] });
-            queryClient.invalidateQueries({ queryKey: ['analysis'] });
         }
     });
 
     const coupleMutation = useMutation({
-        mutationFn: async ({m, t}: any) => {
-            const motor = vehiclesQuery.data.find((v:any) => v.id === m);
-            const trailer = vehiclesQuery.data.find((v:any) => v.id === t);
-            if(motor && trailer) {
-                await Promise.all([
-                    api.put(`/vehicles/${motor.id}`, { ...motor, coupledVehicleId: trailer.id }),
-                    api.put(`/vehicles/${trailer.id}`, { ...trailer, coupledVehicleId: motor.id })
-                ]);
-            }
+        mutationFn: async ({m, t}: { m: string; t: string }) => {
+            await api.post('/transaction/couple', { motorId: m, trailerId: t });
         },
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['vehicles'] })
     });
 
     const uncoupleMutation = useMutation({
-        mutationFn: async ({m, t}: any) => {
-            const motor = vehiclesQuery.data.find((v:any) => v.id === m);
-            if(motor) await api.put(`/vehicles/${motor.id}`, { ...motor, coupledVehicleId: null });
-            if(t) {
-                const trailer = vehiclesQuery.data.find((v:any) => v.id === t);
-                if(trailer) await api.put(`/vehicles/${trailer.id}`, { ...trailer, coupledVehicleId: null });
-            }
+        mutationFn: async ({m, t}: { m: string; t?: string }) => {
+            await api.post('/transaction/uncouple', { motorId: m, trailerId: t });
         },
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['vehicles'] })
     });
@@ -124,7 +114,6 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['logs'] });
             queryClient.invalidateQueries({ queryKey: ['history'] });
-            queryClient.invalidateQueries({ queryKey: ['analysis'] }); // Analysis might need update
         }
     });
 
@@ -133,7 +122,6 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['logs'] });
             queryClient.invalidateQueries({ queryKey: ['history'] });
-            queryClient.invalidateQueries({ queryKey: ['analysis'] });
         }
     });
 
@@ -146,7 +134,6 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
             queryClient.invalidateQueries({ queryKey: ['logs'] }); // Removes from Active List
             queryClient.invalidateQueries({ queryKey: ['vehicles'] }); // Updates mileage
             queryClient.invalidateQueries({ queryKey: ['history'] }); // Updates History View
-            queryClient.invalidateQueries({ queryKey: ['analysis'] }); // Updates Analysis View
         }
     });
 
@@ -159,7 +146,6 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
             queryClient.invalidateQueries({ queryKey: ['logs'] });
             queryClient.invalidateQueries({ queryKey: ['vehicles'] }); // Updates next date
             queryClient.invalidateQueries({ queryKey: ['history'] });
-            queryClient.invalidateQueries({ queryKey: ['analysis'] });
         }
     });
 
@@ -190,33 +176,71 @@ export const FleetProvider = ({ children }: { children?: ReactNode }) => {
     });
 
 
-    // WRAPPERS to match old Interface
-    const saveVehicle = async (v: Vehicle) => { try { await vehicleMutation.mutateAsync(v); return true; } catch { return false; } };
-    const deleteVehicle = async (id: string) => { if(!confirm('Löschen?')) return false; try { await deleteVehicleMutation.mutateAsync(id); return true; } catch { return false; } };
-    const coupleVehicles = async (m: string, t: string) => { await coupleMutation.mutateAsync({m, t}); };
-    const uncoupleVehicles = async (m: string, t?: string) => { await uncoupleMutation.mutateAsync({m, t}); };
-    
-    const saveLogEntry = async (e: any[]) => { try { await saveLogMutation.mutateAsync(e); return true; } catch { return false; } };
-    const updateLogStatus = async (log: LogEntry, s: 'OPEN' | 'IN_PROGRESS' | 'EXTERNAL' | 'DONE') => { try { await saveLogMutation.mutateAsync([{...log, status: s}]); } catch {} };
-    const deleteLog = async (id: string) => { if(!confirm('Löschen?')) return false; try { await deleteLogMutation.mutateAsync(id); return true; } catch { return false; } };
-    const completeTask = async (log: LogEntry, m: number, notes?: string) => { try { await completeTaskMutation.mutateAsync({log, mileage: m, notes}); return true; } catch { return false; } };
-    const completeInspection = async (log: LogEntry, n: string) => { try { await completeInspectionMutation.mutateAsync({log, nextDate: n}); return true; } catch { return false; } };
+    // In-app confirmation modal replacing native window.confirm (blocked in iframes)
+    const [confirmState, setConfirmState] = useState<{ open: boolean; message: string }>({ open: false, message: '' });
+    const confirmResolverRef = useRef<((confirmed: boolean) => void) | null>(null);
 
-    const saveOrder = async (o: any[]) => { try { await saveOrderMutation.mutateAsync(o); return true; } catch { return false; } };
-    const deleteOrder = async (id: string) => { if(!confirm('Löschen?')) return false; try { await deleteOrderMutation.mutateAsync(id); return true; } catch { return false; } };
-    const updateOrderStatus = async (id: string, s: OrderStatus, supplier?: string) => { try { await statusOrderMutation.mutateAsync({id, status: s, supplier}); } catch {} };
+    const requestConfirm = (message: string) => {
+        return new Promise<boolean>((resolve) => {
+            confirmResolverRef.current = resolve;
+            setConfirmState({ open: true, message });
+        });
+    };
+
+    const resolveConfirm = (confirmed: boolean) => {
+        setConfirmState({ open: false, message: '' });
+        if (confirmResolverRef.current) {
+            confirmResolverRef.current(confirmed);
+            confirmResolverRef.current = null;
+        }
+    };
+
+    // WRAPPERS to match old Interface with user-visible error feedback
+    const showMutationError = (action: string, err: any) => {
+        if (err?.status === 409) {
+            queryClient.invalidateQueries();
+            toast.error(err.message || 'Konflikt: Daten wurden zwischenzeitlich geändert und neu geladen.');
+            return;
+        }
+        toast.error(`${action}: ${err?.message || 'Unbekannter Fehler'}`);
+    };
+
+    const saveVehicle = async (v: Vehicle) => { try { await vehicleMutation.mutateAsync(v); return true; } catch (e) { showMutationError('Fahrzeug speichern fehlgeschlagen', e); return false; } };
+    const deleteVehicle = async (id: string) => { if(!(await requestConfirm('Fahrzeug inklusive zugehöriger Historie und Bestellungen wirklich löschen?'))) return false; try { await deleteVehicleMutation.mutateAsync(id); return true; } catch (e) { showMutationError('Fahrzeug löschen fehlgeschlagen', e); return false; } };
+    const coupleVehicles = async (m: string, t: string) => { try { await coupleMutation.mutateAsync({m, t}); } catch (e) { showMutationError('Gespann koppeln fehlgeschlagen', e); } };
+    const uncoupleVehicles = async (m: string, t?: string) => { try { await uncoupleMutation.mutateAsync({m, t}); } catch (e) { showMutationError('Gespann trennen fehlgeschlagen', e); } };
+    
+    const saveLogEntry = async (e: any[]) => { try { await saveLogMutation.mutateAsync(e); return true; } catch (err) { showMutationError('Auftrag speichern fehlgeschlagen', err); return false; } };
+    const updateLogStatus = async (log: LogEntry, s: 'OPEN' | 'IN_PROGRESS' | 'EXTERNAL' | 'DONE') => { try { await saveLogMutation.mutateAsync([{...log, status: s}]); } catch (e) { showMutationError('Status-Änderung fehlgeschlagen', e); } };
+    const deleteLog = async (id: string) => { if(!(await requestConfirm('Diesen Eintrag wirklich löschen?'))) return false; try { await deleteLogMutation.mutateAsync(id); return true; } catch (e) { showMutationError('Eintrag löschen fehlgeschlagen', e); return false; } };
+    const completeTask = async (log: LogEntry, m: number, notes?: string) => { try { await completeTaskMutation.mutateAsync({log, mileage: m, notes}); return true; } catch (e) { showMutationError('Aufgabe abschließen fehlgeschlagen', e); return false; } };
+    const completeInspection = async (log: LogEntry, n: string) => { try { await completeInspectionMutation.mutateAsync({log, nextDate: n}); return true; } catch (e) { showMutationError('Prüfung abschließen fehlgeschlagen', e); return false; } };
+
+    const saveOrder = async (o: any[]) => { try { await saveOrderMutation.mutateAsync(o); return true; } catch (e) { showMutationError('Bestellung speichern fehlgeschlagen', e); return false; } };
+    const deleteOrder = async (id: string) => { if(!(await requestConfirm('Diese Bestellung wirklich löschen?'))) return false; try { await deleteOrderMutation.mutateAsync(id); return true; } catch (e) { showMutationError('Bestellung löschen fehlgeschlagen', e); return false; } };
+    const updateOrderStatus = async (id: string, s: OrderStatus, supplier?: string) => { try { await statusOrderMutation.mutateAsync({id, status: s, supplier}); } catch (e) { showMutationError('Bestellstatus ändern fehlgeschlagen', e); } };
 
     return (
         <FleetContext.Provider value={{
             vehicles: vehiclesQuery.data as Vehicle[],
             logs: logsQuery.data as LogEntry[], // Only ACTIVE logs!
             orders: ordersQuery.data as Order[],
-            loading, error, refetchAll,
+            loading, refetchAll,
             saveVehicle, deleteVehicle, coupleVehicles, uncoupleVehicles,
             saveLogEntry, updateLogStatus, deleteLog, completeTask, completeInspection,
             saveOrder, updateOrderStatus, deleteOrder
         }}>
             {children}
+            <ModalOverlay isOpen={confirmState.open} onClose={() => resolveConfirm(false)} maxWidth="max-w-sm">
+                <div className="p-6">
+                    <h3 className="text-lg font-bold text-gray-800 mb-2">Löschen bestätigen</h3>
+                    <p className="text-sm text-gray-600 mb-6">{confirmState.message}</p>
+                    <div className="flex justify-end gap-3">
+                        <button onClick={() => resolveConfirm(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded font-medium text-sm">Abbrechen</button>
+                        <button onClick={() => resolveConfirm(true)} className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded font-bold text-sm shadow-sm">Löschen</button>
+                    </div>
+                </div>
+            </ModalOverlay>
         </FleetContext.Provider>
     );
 };
